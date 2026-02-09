@@ -1,0 +1,1321 @@
+library(ampvis2)
+library(phyloseq)
+library(Biostrings)
+library(ggplot2)
+library(vegan)
+library(DESeq2)
+library(dplyr)
+library(ampvis2extras)
+library(indicspecies)
+library(pairwiseAdonis)
+library(tibble)
+
+
+ps_to_ampvis <- function(ps) {
+  #Check that the input is a phyloseq object
+  if(class(ps)!= "phyloseq"){
+    stop("Input is not a phyloseq object")
+  }
+  
+  otutable <- data.frame(OTU = rownames(phyloseq::otu_table(ps)@.Data),
+                         (phyloseq::otu_table(ps)@.Data),
+                         phyloseq::tax_table(ps)@.Data,
+                         check.names = FALSE,
+                         row.names = NULL
+  )
+  
+  if(!is.null(ps@sam_data)){
+    metadata <- data.frame(sample = rownames(phyloseq::sample_data(ps)),
+                           phyloseq::sample_data(ps),
+                           check.names = FALSE)
+    av <- ampvis2::amp_load(otutable, metadata)
+  }
+  
+  if(is.null(ps@sam_data)){
+    av <- ampvis2::amp_load(otutable)
+  }
+  #return the object
+  return(av)
+}
+
+######### LOADING DATA ################
+
+
+otudata <- read.table("asv_table.tsv", # Loading otutable
+                      sep="\t", 
+                      header=TRUE, 
+                      stringsAsFactors=TRUE, 
+                      row.names = 1, 
+                      comment.char ="")
+
+taxdata <- read.table("asv_taxa.tsv",  # Loading otutable
+                      sep="\t", 
+                      header=TRUE, 
+                      stringsAsFactors=TRUE, 
+                      row.names = 1, 
+                      comment.char ="",
+                      fill=TRUE)
+
+metadata <- read.table("metadata_combi.tsv", # Loading Metadata
+                       sep="\t", 
+                       header=TRUE, 
+                       stringsAsFactors=TRUE, 
+                       row.names = 1, 
+                       comment.char ="" )
+#View(metadata)
+
+### Combining the three tables ###
+
+# As an Phyloseq object
+ps<- phyloseq(otu_table(as.matrix(otudata),taxa_are_rows = TRUE),
+              sample_data(metadata),
+              tax_table(as.matrix(taxdata)))
+
+# And as a Ampvis2 object
+amp<-ps_to_ampvis(ps) # Turns the phyloseq obeject into a ampvis object
+#_________________________________________________________________
+#abundance heatmap
+
+
+p1 <- amp_heatmap(amp, # Datahttp://127.0.0.1:47671/graphics/plot_zoom_png?width=1610&height=811
+                  group_by = ("lib.unin"), # Group by
+                  facet_by = ("response"), #Faceting function (sub grouping)
+                  tax_aggregate =
+                    "Genus", # Which taxonomic level to demonstrate
+                  tax_add = "Family", # Add a taxonomic level
+                  tax_show = 15) +
+  theme(axis.text.x = element_text(angle = 45, size=12, vjust = 1),
+        axis.text.y = element_text(size=12, face = "italic"),
+        legend.position="right",legend.text = element_text(size = 10))
+p1
+
+p1.2 <- p1 +
+  scale_x_discrete(labels = c("library" = "library-inoculated",
+                              "uninoculated" = "uninoculated"))
+
+ggsave(p1.2,filename = 'heatmap.png',width = 8.5, height = 7, dpi = 400)
+
+#__________
+
+library(phyloseq)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(tibble)
+
+# 1. Agglomerate to genus level (taxrank is lowercase 'genus')
+ps_genus <- tax_glom(ps, taxrank = "genus")
+
+# 2. Transform counts to relative abundances per sample
+ps_rel <- transform_sample_counts(ps_genus, function(x) x / sum(x))
+
+# 3. Extract taxonomy table and clean genus names
+tax_df <- as.data.frame(tax_table(ps_rel)) %>%
+  mutate(genus = str_trim(genus))
+
+# 4. Prepare genus names for column assignment:
+# Replace NA or empty with "Unknown"
+genus_names <- tax_df$genus
+genus_names[is.na(genus_names) | genus_names == ""] <- "Unknown"
+
+# Make genus names unique to avoid duplicate column names
+genus_names_unique <- make.unique(genus_names, sep = "_")
+
+# 5. Extract OTU relative abundance table (samples × genera)
+otu_rel_df <- as.data.frame(t(otu_table(ps_rel)))  # transpose so samples are rows
+colnames(otu_rel_df) <- genus_names_unique         # assign unique genus names
+otu_rel_df$SampleID <- rownames(otu_rel_df)        # add SampleID column
+rownames(otu_rel_df) <- NULL                        # remove rownames for safety
+
+# 6. Extract sample metadata as regular data.frame with SampleID column
+sample_df <- as.data.frame(sample_data(ps_rel), stringsAsFactors = FALSE)
+sample_df$SampleID <- rownames(sample_df)
+rownames(sample_df) <- NULL
+sample_df <- sample_df[, c("SampleID", "lib_response")]  # keep only needed columns
+
+# Convert sample_df and otu_rel_df to tibble explicitly
+sample_df <- as_tibble(sample_df)
+otu_rel_df <- as_tibble(otu_rel_df)
+
+# Perform the join, result is a tibble
+joined_df <- left_join(sample_df, otu_rel_df, by = "SampleID")
+
+
+# 8. Pivot longer so we have one row per sample × genus
+long_df <- joined_df %>%
+  pivot_longer(cols = -c(SampleID, lib_response),
+               names_to = "genus",
+               values_to = "rel_abund")
+
+# 9. Group by genus and lib_response to calculate mean relative abundance
+mean_genus_abund <- long_df %>%
+  group_by(genus, lib_response) %>%
+  summarise(mean_rel_abund = mean(rel_abund, na.rm = TRUE), .groups = "drop")
+
+# 10. Pivot wider to get lib_response groups as columns, fill missing with zero
+mean_genus_abund_wide <- mean_genus_abund %>%
+  pivot_wider(names_from = lib_response, values_from = mean_rel_abund, values_fill = 0)
+
+# View the result
+head(mean_genus_abund_wide)
+
+
+# 12. Optional: View or save results
+print(head(mean_genus_abund_wide))
+write.csv(mean_genus_abund_wide, "mean_genus_abundance_by_lib_response.csv", row.names = FALSE)
+
+
+
+#____________
+
+amp$metadata <- amp$metadata %>% mutate(lib_lineage=paste(lib.unin,lineage,sep = "_"))
+p2 <- amp_heatmap(amp, # Data
+                  group_by = ("lib_lineage"), # Group by
+                  facet_by = ("response"), #Faceting function (sub grouping)
+                  tax_aggregate =
+                    "Genus", # Which taxonomic level to demonstrate
+                  tax_add = "Family", # Add a taxonomic level
+                  tax_show = 15) +
+  theme(axis.text.x = element_text(angle = 45, size=10, vjust = 1),
+        axis.text.y = element_text(size=10, face = "italic"),
+        legend.position="right",legend.text = element_text(size = 10))
+p2
+
+ggsave(p1,filename = 'genus_16s.png',width = 8, height = 6, dpi = 400)
+ggsave(p2,filename = 'genus_lib_lineage.png',width = 16, height = 12, dpi = 400)
+
+
+#_________________________________________________________________
+# Identify the sample with the lowest reads
+### Rarefy the data and calculate the alpha diversity ###
+
+set.seed(111)
+ps.rarefied = rarefy_even_depth(ps,sample.size=)
+
+#sample colors
+sample_colors <- c("dodgerblue3", "green3", "darkorange1")
+
+#overall_alphadiv, violin plot
+p3 <- ps.rarefied %>%                                                                           #phyloseq object
+  plot_richness(
+    x = "response",                                                                    #compare diversity of datatype
+    measures = c("Observed", "Shannon")) +                                             #choose diversity measures
+  geom_boxplot(aes(fill = response), show.legend = FALSE)+                             #make violin plot, set fill aes to sampletype
+  theme_linedraw()+                                                                    #change theme to classic
+  theme(axis.text.y.left = element_text(size = 15),                                    #adjust y-axis text
+        axis.text.x = element_text(size = 15, hjust = 0.5, vjust = 1, angle = 0),      #adjust x-axis label position
+        axis.title.y = element_text(size = 15),
+        axis.title.x = element_text(size = 15))+                                       #adjust y-axis title
+  theme(strip.text = element_text(face = "bold", size = 15))+                          #adjust headings
+  scale_x_discrete(name = "Response") +
+  scale_fill_manual(values = sample_colors)                                            #set fill colors
+p3
+
+ggsave(p3,filename = 'alpha_diversity.png',width = 8, height = 6, dpi = 400)
+
+# Alpha-diversity table
+alphadiversityresult<-amp_alphadiv(amp,measure = c("Observed","Shannon"),rarefy = 1032) #rarefied by reads 1032, bc this is the lowest read number among all of the samples
+write.csv(alphadiversityresult, file = "alphadiversityresult.csv") # For exporting the table to a csv file
+richness <- read.table("alphadiversityresult.csv", # Loading otutable
+                       sep=",", 
+                       header=TRUE, 
+                       stringsAsFactors=TRUE, 
+                       row.names = 1, 
+                       comment.char ="" )
+# statistic calculation of alpha diversity
+richness_uninoculated <- subset(richness, lib.unin == "uninoculated")
+aov_uninoculated <- aov(Shannon ~ response, data = richness_uninoculated)
+summary(aov_uninoculated)
+turkey_uninoculated <- TukeyHSD(aov_uninoculated)
+
+turkey_uninoculated
+
+#$response
+#                           diff        lwr         upr     p adj
+#resilient-nostress    -0.2885027 -0.5422862 -0.03471922 0.0226350
+#susceptible-nostress  -0.5277867 -0.7815702 -0.27400318 0.0000264
+#susceptible-resilient -0.2392840 -0.4930675  0.01449953 0.0681561
+
+richness_library <- subset(richness, lib.unin == "library")
+aov_library <- aov(Shannon ~ response, data = richness_library)
+summary(aov_library)
+turkey_library <- TukeyHSD(aov_library)
+turkey_library
+
+#$response
+#                           diff        lwr        upr     p adj
+#resilient-nostress    -0.35511102 -0.5891444 -0.1210776 0.0018751
+#susceptible-nostress  -0.42228898 -0.6563224 -0.1882556 0.0002327
+#susceptible-resilient -0.06717796 -0.2926982  0.1583423 0.7502123
+
+
+letters_df <- data.frame(
+  group = rep(c("nostress", "resilient", "susceptible"), 2),
+  facet = c(rep("uninoculated", 3), rep("library", 3)),
+  letters = c("a","b","b","a","b","b"),
+  y_position = c(4.2, 4.2, 4.2, 4.2, 4.2, 4.2))
+
+#shannon alpha diversity, with two different groups
+sample_colorsplus <- c("#3172BD", "#1A9D1A", "#F79308","#75C0F5","#A2E06B","#FCC84E")
+
+#sample_colorsplus <- c("#3172BD", "#22800A", "#F79308","#41BEFC","#6EE04E","#FCD80F")
+
+p4 <- ps.rarefied %>%                                                                  #phyloseq object
+  plot_richness(
+    x = "response",                                                                    #compare diversity of datatype
+    measures = "Shannon") +                                                            #choose diversity measures
+  geom_boxplot(aes(fill = lib_response), show.legend = FALSE) +
+  geom_text(
+    data = letters_df,
+    aes(x = group, y = y_position, label = letters),
+    inherit.aes = FALSE,
+    size = 5) +
+  facet_wrap(~ lib.unin) +                                                             #make violin plot, set fill aes to sampletype
+  theme_linedraw()+                                                                    #change theme to classic
+  theme(axis.text.y.left = element_text(size = 15),                                    #adjust y-axis text
+        axis.text.x = element_text(size = 15, hjust = 0.5, vjust = 1, angle = 0),      #adjust x-axis label position
+        axis.title.y = element_text(size = 15),
+        axis.title.x = element_text(size = 15))+                                       #adjust y-axis title
+  theme(strip.text = element_text(face = "bold", size = 15))+                          #adjust headings
+  scale_x_discrete(name = "Response") +
+  scale_fill_manual(values = sample_colorsplus)                                            #set fill colors
+p4
+
+ggsave(p4,filename = 'alphadiv_libiunin.png',width = 8, height = 6, dpi = 400)
+
+p4 <- ps.rarefied %>%
+  plot_richness(
+    x = "response",
+    measures = "Shannon") +
+  geom_boxplot(aes(fill = lib_response), show.legend = FALSE) +
+  geom_text(
+    data = letters_df,
+    aes(x = group, y = y_position, label = letters),
+    inherit.aes = FALSE,
+    size = 5) +
+  facet_wrap(
+    ~ lib.unin,
+    labeller = as_labeller(c(
+      "library" = "library-inoculated",
+      "uninoculated" = "uninoculated"
+    ))
+  ) +
+  theme_linedraw() +
+  theme(
+    axis.text.y.left = element_text(size = 15),
+    axis.text.x = element_text(size = 15, hjust = 0.5, vjust = 1, angle = 0),
+    axis.title.y = element_text(size = 15),
+    axis.title.x = element_text(size = 15, margin = margin(t = 12)),  # extra space above title
+    strip.text = element_text(size = 15, color = "black"),
+    strip.background = element_rect(fill = "grey80", color = NA),
+    panel.grid.major = element_line(color = "grey80", size = 0.4),
+    panel.grid.minor = element_line(color = "grey80", size = 0.4)
+  ) +
+  scale_x_discrete(name = "Selection type") +
+  scale_fill_manual(values = sample_colorsplus)
+
+p4
+
+
+ggsave(p4, filename = 'alphadiv_libiunin.png', width = 8, height = 6, dpi = 400)
+
+ggsave(p4, filename = 'alphadiv_libiunin.png', width = 8, height = 6, dpi = 400)
+
+
+
+
+
+#_________________________________________________________________
+# Rarefaction curve
+p5 <- amp_rarecurve(amp, # Data 
+                    stepsize = 100, # visual step size
+                    color_by = "response") +
+  scale_color_manual(values = c("dodgerblue3", "green3", "darkorange1")) +             #Colorvariable, from metadata
+  theme(axis.text.y.left = element_text(size = 15),                                    #adjust y-axis text
+        axis.text.x = element_text(size = 15, hjust = 0.5, vjust = 1, angle = 0),      #adjust x-axis label position
+        axis.title.y = element_text(size = 15),
+        axis.title.x = element_text(size = 15),                                        #adjust y-axis title
+        legend.text = element_text(size = 15),
+        legend.title = element_text(size = 15))                                       
+
+p5
+ggsave(p5,filename = 'rarefaction_curve.png',width = 8, height = 6, dpi = 400)
+
+p5.1 <- amp_rarecurve(amp, # Data 
+                    stepsize = 100, # visual step size
+                    color_by = "lib.unin") +
+  scale_color_manual(values = c("black", "red")) +             #Colorvariable, from metadata
+  theme(axis.text.y.left = element_text(size = 15),                                    #adjust y-axis text
+        axis.text.x = element_text(size = 15, hjust = 0.5, vjust = 1, angle = 0),      #adjust x-axis label position
+        axis.title.y = element_text(size = 15),
+        axis.title.x = element_text(size = 15),                                        #adjust y-axis title
+        legend.text = element_text(size = 15),
+        legend.title = element_text(size = 15))                                       
+
+p5.1
+
+ggsave(p5,filename = 'rarefaction_curve.png',width = 8, height = 6, dpi = 400)
+
+# Does the samples within the groups look similar or dissimilar from each other
+
+#### Ordination plots ###### Visualizing how similar/dissimilar samples are
+
+###PCoA
+Pcoa_plot <-amp_ordinate(amp, # Data
+                         type="PCoA", # Plot type
+                         distmeasure = "bray",
+                         transform = "None",# Distance measure u
+                         sample_color_by="response", # Sample colouring
+                         sample_colorframe=TRUE, # Line frame around the group
+                         sample_shape_by="lineage", # Shaping of the samples
+                         x_axis=1, # X-axis dimension
+                         y_axis=2) # Y-axis dimension
+
+
+p6 <- Pcoa_plot + 
+  scale_color_manual(values = c("dodgerblue3", "green3", "darkorange1")) + # Specify your colors here
+  scale_fill_manual(values = c("dodgerblue3", "green3", "darkorange1")) + # Fill colors
+  theme(axis.text.y.left = element_text(size = 15),                                    #adjust y-axis text
+        axis.text.x = element_text(size = 15, hjust = 0.5, vjust = 1, angle = 0),      #adjust x-axis label position
+        axis.title.y = element_text(size = 15),
+        axis.title.x = element_text(size = 15),                                        #adjust y-axis title
+        legend.text = element_text(size = 15),
+        legend.title = element_text(size = 15),
+        panel.background = element_rect(fill = "white", color = NA),
+        plot.background = element_rect(fill = "white", color = NA))
+
+# Display the plot
+print(p6)
+ggsave(p6,filename = 'PCOA.png',width = 8, height = 6, dpi = 400)
+
+Pcoa_plot <-amp_ordinate(amp, # Data
+                         type="PCoA", # Plot type
+                         distmeasure = "bray",
+                         transform = "None",# Distance measure u
+                         sample_color_by="lib_response", # Sample colouring
+                         sample_colorframe=TRUE, # Line frame around the group
+                         sample_shape_by="lineage", # Shaping of the samples
+                         x_axis=1, # X-axis dimension
+                         y_axis=2) # Y-axis dimension
+
+#scale_color_manual(values = c("dodgerblue3", "green3", "darkorange1","#74ABE1","#7fe67f","#ffbf7f")) + # Specify your colors here
+ # scale_fill_manual(values = c("dodgerblue3", "green3", "darkorange1","#74ABE1","#7fe67f","#ffbf7f")) + # Fill colors
+
+
+p7 <- Pcoa_plot + 
+  scale_color_manual(values = c("steelblue3", "green3", "darkorange1","lightblue1","#7fe67f","#ffbf7f")) + # Specify your colors here
+  scale_fill_manual(values = c("steelblue3", "green3", "darkorange1","lightblue1","#7fe67f","#ffbf7f")) + # Fill colors
+  theme(axis.text.y.left = element_text(size = 15),                                    #adjust y-axis text
+        axis.text.x = element_text(size = 15, hjust = 0.5, vjust = 1, angle = 0),      #adjust x-axis label position
+        axis.title.y = element_text(size = 15),
+        axis.title.x = element_text(size = 15),                                        #adjust y-axis title
+        legend.text = element_text(size = 15),
+        legend.title = element_text(size = 15),
+        panel.background = element_rect(fill = "white", color = NA),
+        plot.background = element_rect(fill = "white", color = NA))
+
+p7 <- Pcoa_plot + 
+  scale_color_manual(values = c("steelblue3", "green3", "darkorange1", "lightblue2", "#7fe67f", "#ffbf7f")) + # Specify your colors here
+  scale_fill_manual(values = c("steelblue3", "green3", "darkorange1", "#add8e6FF", "#5fd75f", "#ff9f5f")) + # Adjust fill colors
+  theme(
+    axis.text.y.left = element_text(size = 15, color = "white"),                                    # Adjust y-axis text
+    axis.text.x = element_text(size = 15, hjust = 0.5, vjust = 1, angle = 0, color = "white"),      # Adjust x-axis label position
+    axis.title.y = element_text(size = 15, color = "white"),                                        # Adjust y-axis title
+    axis.title.x = element_text(size = 15, color = "white"),                                        # Adjust x-axis title
+    legend.text = element_text(size = 15, color = "white"),                                         # Adjust legend text
+    legend.title = element_text(size = 15, color = "white"),                                        # Adjust legend title
+    panel.background = element_rect(fill = "white", color = NA),                                # Background color
+    plot.background = element_rect(fill = "white", color = NA),                                 # Background color
+    panel.grid.major = element_blank(),                                                            # Remove major gridlines
+    panel.grid.minor = element_blank()                                                             # Remove minor gridlines
+  )
+
+p7 <- Pcoa_plot + 
+  scale_color_manual(
+    values = c("steelblue3", "green3", "darkorange1", "#add8e6FF", "#7fe67f", "#ffbf7f"),
+    labels = c(
+      "library-inoculated nostress", 
+      "library-inoculated resilient", 
+      "library-inoculated susceptible", 
+      "uninoculated nostress", 
+      "uninoculated resilient", 
+      "uninoculated susceptible"
+    ),
+    name = NULL  # legend title for this variable
+  ) +
+  scale_fill_manual(
+    values = c("steelblue3", "green3", "darkorange1", "#add8e6FF", "#7fe67f", "#ffbf7f"),
+    labels = c(
+      "library-inoculated nostress", 
+      "library-inoculated resilient", 
+      "library-inoculated susceptible", 
+      "uninoculated nostress", 
+      "uninoculated resilient", 
+      "uninoculated susceptible"
+    ),
+    name = NULL  # fill legend title (matches color legend)
+  ) +
+  theme(
+    axis.text.y.left = element_text(size = 15),
+    axis.text.x = element_text(size = 15, hjust = 0.5, vjust = 1, angle = 0),
+    axis.title.y = element_text(size = 15),
+    axis.title.x = element_text(size = 15),
+    legend.text = element_text(size = 15),
+    legend.title = element_text(size = 15),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background = element_rect(fill = "white", color = NA),
+    legend.position = "bottom",
+    legend.box = "horizontal",   # Stack legends vertically
+    legend.direction = "vertical", # Keep entries vertical
+    legend.justification = "center",
+    legend.spacing.x = unit(2, "cm")  # space between the two legend boxes
+  )
+
+
+p7 <- Pcoa_plot + 
+  scale_color_manual(
+    values = c("#3172BD", "#1A9D1A", "#F79308","#75C0F5","#A2E06B","#FCC84E"),
+    labels = c(
+      "library-inoculated nostress", 
+      "library-inoculated resilient", 
+      "library-inoculated susceptible", 
+      "uninoculated nostress", 
+      "uninoculated resilient", 
+      "uninoculated susceptible"
+    ),
+    name = NULL  # legend title for this variable
+  ) +
+  scale_fill_manual(
+    values = c("#3172BD", "#1A9D1A", "#F79308","#75C0F5","#A2E06B","#FCC84E"),
+    labels = c(
+      "library-inoculated nostress", 
+      "library-inoculated resilient", 
+      "library-inoculated susceptible", 
+      "uninoculated nostress", 
+      "uninoculated resilient", 
+      "uninoculated susceptible"
+    ),
+    name = NULL  # fill legend title (matches color legend)
+  ) +
+  theme(
+    axis.text.y.left = element_text(size = 15),
+    axis.text.x = element_text(size = 15, hjust = 0.5, vjust = 1, angle = 0),
+    axis.title.y = element_text(size = 15),
+    axis.title.x = element_text(size = 15),
+    legend.text = element_text(size = 15),
+    legend.title = element_text(size = 15),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background = element_rect(fill = "white", color = NA),
+    legend.position = "bottom",
+    legend.box = "horizontal",   # Stack legends vertically
+    legend.direction = "vertical", # Keep entries vertical
+    legend.justification = "center",
+    legend.spacing.x = unit(2, "cm")  # space between the two legend boxes
+  )
+
+
+
+print(p7)
+ggsave(p7,filename = 'PCOA_lib_response_different_colors.png',width = 7, height = 8.5, dpi = 400)
+
+
+##Adonis/PERMANOVA
+dist_matrix <- vegdist(t(amp$abund), method = "bray")
+table(metadata$lib_response)
+lib_response_adonis <- adonis2(dist_matrix ~ lib_response, data = metadata, permutations = 999)
+print(lib_response_adonis)
+
+
+#         Df    SumOfSqs   R2   F   Pr(>F)    
+#Model     5   8.0246 0.3602 9.2331  0.001 ***
+#Residual 82  14.2534 0.6398                  
+#Total    87  22.2779 1.0000                  
+#---
+#  Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+
+
+pairwise.adonis(dist_matrix, factors = metadata$lib_response)
+
+#pairs                                                 Df SumsOfSqs   F.Model         R2 p.value p.adjusted sig
+#1          uninoculated_resilient vs library_nostress  1 1.9160574 12.053245 0.31674684   0.001      0.015   .
+#2     uninoculated_resilient vs uninoculated_nostress  1 1.2641229  7.372860 0.20843269   0.001      0.015   .
+#3         uninoculated_resilient vs library_resilient  1 1.4405717  7.816309 0.21823325   0.001      0.015   .
+#4       uninoculated_resilient vs library_susceptible  1 1.5863254  7.804712 0.21798003   0.001      0.015   .
+#5  uninoculated_resilient vs uninoculated_susceptible  1 1.0007646  4.433318 0.13669023   0.001      0.015   .
+#6           library_nostress vs uninoculated_nostress  1 0.9267095  8.011352 0.23554935   0.001      0.015   .
+#7               library_nostress vs library_resilient  1 0.7962534  6.148207 0.19124571   0.001      0.015   .
+#8             library_nostress vs library_susceptible  1 1.3750519  9.172123 0.26077820   0.001      0.015   .
+#9        library_nostress vs uninoculated_susceptible  1 3.1697492 18.203250 0.41180795   0.001      0.015   .
+#10         uninoculated_nostress vs library_resilient  1 1.5338389 10.643971 0.27543678   0.001      0.015   .
+#11       uninoculated_nostress vs library_susceptible  1 1.9338762 11.860418 0.29754876   0.001      0.015   .
+#12  uninoculated_nostress vs uninoculated_susceptible  1 2.9039136 15.651325 0.35855326   0.001      0.015   .
+#13           library_resilient vs library_susceptible  1 0.4213121  2.395179 0.07880128   0.011      0.165    
+#14      library_resilient vs uninoculated_susceptible  1 1.9286525  9.721768 0.25772302   0.001      0.015   .
+#15    library_susceptible vs uninoculated_susceptible  1 1.8871022  8.682963 0.23670288   0.001      0.015   .
+
+
+
+
+#What is the specific effect size of response and lib.unin onto the microbiome? (separately:)
+
+adonis2(dist_matrix ~ response + lib.unin, 
+  data = metadata, 
+  permutations = 999, 
+  by = "margin")
+
+
+#adonis2(formula = dist_matrix ~ response + lib.unin, data = metadata, permutations = 999, by = "margin")
+#         Df SumOfSqs    R2      F    Pr(>F)    
+#response  2   3.8172 0.17134 10.284  0.001 ***
+#lib.unin  1   2.9179 0.13098 15.722  0.001 ***
+#Residual 84  15.5899 0.69979                  
+#Total    87  22.2779 1.00000  
+#This means that:
+#Response explains 17% of the variation, while lib.unin explains 13% of the variation. Both are significant determinants of the rhizosphere microbiome on their own: p=0.001
+
+
+#Do lib_response and lineage together explain significant variation? Clearly yes:
+library(vegan)
+
+# distance matrix (unchanged)
+dist_matrix <- vegdist(t(amp$abund), method = "bray")
+
+# ensure factors
+metadata$lib_response <- factor(metadata$lib_response)
+metadata$lineage      <- factor(metadata$lineage)
+
+# PERMANOVA with lineage included
+adonis_libresp_lineage <- adonis2(
+  dist_matrix ~ lib_response + lineage,
+  data = metadata,
+  permutations = 999
+)
+
+print(adonis_libresp_lineage)
+
+
+#adonis2(formula = dist_matrix ~ lib_response + lineage, data = metadata, permutations = 999)
+#         Df SumOfSqs     R2      F Pr(>F)    
+#Model     7   8.5593 0.3842 7.1304  0.001 ***
+#Residual 80  13.7187 0.6158                  
+#Total    87  22.2779 1.0000    
+
+
+#“How much variance does lib_response explain on its own?”
+#“How much variance does lineage explain on its own?”
+#To get separate R² values for each term, you need to run:
+
+adonis_libresp_lineage <- adonis2(
+  dist_matrix ~ lib_response + lineage,
+  data = metadata,
+  permutations = 999,
+  by = "margin"
+)
+
+print(adonis_libresp_lineage)
+
+#adonis2(formula = dist_matrix ~ lib_response + lineage, data = metadata, permutations = 999, by = "margin")
+#              Df SumOfSqs   R2      F     Pr(>F)    
+#lib_response  5   7.9904 0.35867 9.3191  0.001 ***
+#lineage       2   0.5347 0.02400 1.5590  0.079 .  
+#Residual     80  13.7187 0.61580                  
+#Total        87  22.2779 1.00000  
+
+
+
+#_____________lineage convergence/divergence_____________
+
+library(gridExtra)
+#____________subset group, lib_response:library_no stress_________
+library_nostress <- amp_subset_samples(amp,lib_response %in% c("library_nostress"))
+
+Pcoa_plot <-amp_ordinate(library_nostress, # Data
+                         type="PCoA", # Plot type
+                         distmeasure = "bray",
+                         transform = "None",# Distance measure u
+                         sample_color_by="lineage", # Sample colouring
+                         sample_colorframe=TRUE, # Line frame around the group
+                         sample_shape_by="lineage", # Shaping of the samples
+                         x_axis=1, # X-axis dimension
+                         y_axis=2) # Y-axis dimension
+
+
+p8 <- Pcoa_plot + 
+  scale_color_manual(values = c("#3172BD", "#3172BD", "#3172BD")) + # Specify your colors here
+  scale_fill_manual(values = c("#3172BD", "#3172BD", "#3172BD")) + # Fill colors
+  theme(
+    axis.text.y.left = element_text(size = 15),                                    # adjust y-axis text
+    axis.text.x = element_text(size = 15, hjust = 0.5, vjust = 1, angle = 0),      # adjust x-axis label position
+    axis.title.y = element_text(size = 15),
+    axis.title.x = element_text(size = 15),                                        # adjust y-axis title
+    legend.position = "none",
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background = element_rect(fill = "white", color = NA),
+    plot.title = element_text(size = 15, hjust = 0.5)               # title size + style
+  ) +
+  ggtitle("library-inoculated nostress")
+
+print(p8)
+
+##Adonis/PERMANOVA
+dist_matrix <- vegdist(t(library_nostress$abund), method = "bray")
+table(metadata$lineage)
+library_nostress_adonis <- adonis2(dist_matrix ~ lineage, data = library_nostress$metadata, permutations = 999)
+print(library_nostress_adonis)
+
+#         Df SumOfSqs      R2      F Pr(>F)
+#Model     2  0.24352 0.20814 1.3143  0.247
+#Residual 10  0.92643 0.79186              
+#Total    12  1.16994 1.00000
+
+##Anosim
+library_nostress_anosim <- anosim(dist_matrix, grouping = as.factor(library_nostress$metadata$Sample), permutations = 999)
+print(library_nostress_anosim)
+
+#ANOSIM statistic R: 0.1431 
+#Significance: 0.136 
+
+#____________subset group, lib_response:library_resilient_________
+library_resilient <- amp_subset_samples(amp,lib_response %in% c("library_resilient"))
+
+Pcoa_plot <-amp_ordinate(library_resilient, # Data
+                         type="PCoA", # Plot type
+                         distmeasure = "bray",
+                         transform = "None",# Distance measure u
+                         sample_color_by="lineage", # Sample colouring
+                         sample_colorframe=TRUE, # Line frame around the group
+                         sample_shape_by="lineage", # Shaping of the samples
+                         x_axis=1, # X-axis dimension
+                         y_axis=2) # Y-axis dimension
+
+p9 <- Pcoa_plot + 
+  scale_color_manual(values = c("#1A9D1A", "#1A9D1A", "#1A9D1A")) + # Specify your colors here
+  scale_fill_manual(values = c("#1A9D1A", "#1A9D1A", "#1A9D1A")) + # Fill colors
+  theme(
+    axis.text.y.left = element_text(size = 15),                                    # adjust y-axis text
+    axis.text.x = element_text(size = 15, hjust = 0.5, vjust = 1, angle = 0),      # adjust x-axis label position
+    axis.title.y = element_text(size = 15),
+    axis.title.x = element_text(size = 15),                                        # adjust y-axis title
+    legend.position = "none",
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background = element_rect(fill = "white", color = NA),
+    plot.title = element_text(size = 15, hjust = 0.5)               # title size + style
+  ) +
+  ggtitle("library-inoculated resilient")
+
+print(p9)
+
+##Adonis/PERMANOVA
+dist_matrix <- vegdist(t(library_resilient$abund), method = "bray")
+table(metadata$lineage)
+library_resilient_adonis <- adonis2(dist_matrix ~ lineage, data = library_resilient$metadata, permutations = 999)
+print(library_resilient_adonis)
+
+#         Df SumOfSqs      R2      F Pr(>F)
+#Model     2  0.36501 0.16612 1.1952  0.258
+#Residual 12  1.83231 0.83388              
+#Total    14  2.19732 1.00000 
+
+##Anosim
+library_resilient_anosim <- anosim(dist_matrix, grouping = as.factor(library_resilient$metadata$Sample), permutations = 999)
+print(library_resilient_anosim)
+
+#ANOSIM statistic R: 0.088 
+#Significance: 0.147 
+
+#____________subset group, lib_response:library_susceptible_________
+library_susceptible <- amp_subset_samples(amp,lib_response %in% c("library_susceptible"))
+
+Pcoa_plot <-amp_ordinate(library_susceptible, # Data
+                         type="PCoA", # Plot type
+                         distmeasure = "bray",
+                         transform = "None",# Distance measure u
+                         sample_color_by="lineage", # Sample colouring
+                         sample_colorframe=TRUE, # Line frame around the group
+                         sample_shape_by="lineage", # Shaping of the samples
+                         x_axis=1, # X-axis dimension
+                         y_axis=2) # Y-axis dimension
+
+
+p10 <- Pcoa_plot + 
+  scale_color_manual(values = c("#F79308", "#F79308", "#F79308")) + # Specify your colors here
+  scale_fill_manual(values = c("#F79308", "#F79308", "#F79308")) + # Fill colors
+  theme(
+    axis.text.y.left = element_text(size = 15),                                    # adjust y-axis text
+    axis.text.x = element_text(size = 15, hjust = 0.5, vjust = 1, angle = 0),      # adjust x-axis label position
+    axis.title.y = element_text(size = 15),
+    axis.title.x = element_text(size = 15),                                        # adjust y-axis title
+    legend.position = "none",
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background = element_rect(fill = "white", color = NA),
+    plot.title = element_text(size = 15, hjust = 0.5)               # title size + style
+  ) +
+  ggtitle("library-inoculated susceptible")
+
+
+print(p10)
+
+##Adonis/PERMANOVA
+dist_matrix <- vegdist(t(library_susceptible$abund), method = "bray")
+table(metadata$lineage)
+library_susceptible_adonis <- adonis2(dist_matrix ~ lineage, data = library_susceptible$metadata, permutations = 999)
+print(library_susceptible_adonis)
+
+#         Df SumOfSqs     R2      F Pr(>F)
+#Model     2   0.5273 0.1933 1.4377  0.134
+#Residual 12   2.2006 0.8067              
+#Total    14   2.7279 1.0000  
+
+##Anosim
+library_susceptible_anosim <- anosim(dist_matrix, grouping = as.factor(library_susceptible$metadata$Sample), permutations = 999)
+print(library_susceptible_anosim)
+
+#ANOSIM statistic R: 0.1173 
+#Significance: 0.123 
+
+#____________subset group, lib_response:uninoculated_nostress_________
+uninoculated_nostress <- amp_subset_samples(amp,lib_response %in% c("uninoculated_nostress"))
+
+Pcoa_plot <-amp_ordinate(uninoculated_nostress, # Data
+                         type="PCoA", # Plot type
+                         distmeasure = "bray",
+                         transform = "None",# Distance measure u
+                         sample_color_by="lineage", # Sample colouring
+                         sample_colorframe=TRUE, # Line frame around the group
+                         sample_shape_by="lineage", # Shaping of the samples
+                         x_axis=1, # X-axis dimension
+                         y_axis=2) # Y-axis dimension
+
+
+p11 <- Pcoa_plot + 
+  scale_color_manual(values = c("#75C0F5", "#75C0F5", "#75C0F5")) + # Specify your colors here
+  scale_fill_manual(values = c("#75C0F5", "#75C0F5", "#75C0F5")) + # Fill colors
+  theme(
+    axis.text.y.left = element_text(size = 15),                                    # adjust y-axis text
+    axis.text.x = element_text(size = 15, hjust = 0.5, vjust = 1, angle = 0),      # adjust x-axis label position
+    axis.title.y = element_text(size = 15),
+    axis.title.x = element_text(size = 15),                                        # adjust y-axis title
+    legend.position = "none",
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background = element_rect(fill = "white", color = NA),
+    plot.title = element_text(size = 15, hjust = 0.5)               # title size + style
+  ) +
+  ggtitle("uninoculated nostress")
+
+
+print(p11)
+
+##Adonis/PERMANOVA
+dist_matrix <- vegdist(t(uninoculated_nostress$abund), method = "bray")
+table(metadata$lineage)
+uninoculated_nostress_adonis <- adonis2(dist_matrix ~ lineage, data = uninoculated_nostress$metadata, permutations = 999)
+print(uninoculated_nostress_adonis)
+
+          #Df SumOfSqs      R2      F Pr(>F)    
+#Model     2  0.70291 0.38252 3.7169  0.001 ***
+#Residual 12  1.13468 0.61748                  
+#Total    14  1.83760 1.00000                  
+#---
+#  Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+
+##Anosim
+uninoculated_nostress_anosim <- anosim(dist_matrix, grouping = as.factor(uninoculated_nostress$metadata$Sample), permutations = 999)
+print(uninoculated_nostress_anosim) 
+
+#ANOSIM statistic R: 0.4631 
+#Significance: 0.001 
+
+
+#____________subset group, lib_response:uninoculated_resilient_________
+uninoculated_resilient <- amp_subset_samples(amp,lib_response %in% c("uninoculated_resilient"))
+
+Pcoa_plot <-amp_ordinate(uninoculated_resilient, # Data
+                         type="PCoA", # Plot type
+                         distmeasure = "bray",
+                         transform = "None",# Distance measure u
+                         sample_color_by="lineage", # Sample colouring
+                         sample_colorframe=TRUE, # Line frame around the group
+                         sample_shape_by="lineage", # Shaping of the samples
+                         x_axis=1, # X-axis dimension
+                         y_axis=2) # Y-axis dimension
+
+
+p12 <- Pcoa_plot + 
+  scale_color_manual(values = c("#A2E06B", "#A2E06B", "#A2E06B")) + # Specify your colors here
+  scale_fill_manual(values = c("#A2E06B", "#A2E06B", "#A2E06B")) + # Fill colors
+  theme(
+    axis.text.y.left = element_text(size = 15),                                    # adjust y-axis text
+    axis.text.x = element_text(size = 15, hjust = 0.5, vjust = 1, angle = 0),      # adjust x-axis label position
+    axis.title.y = element_text(size = 15),
+    axis.title.x = element_text(size = 15),                                        # adjust y-axis title
+    legend.position = "none",
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background = element_rect(fill = "white", color = NA),
+    plot.title = element_text(size = 15, hjust = 0.5)               # title size + style
+  ) +
+  ggtitle("uninoculated resilient")
+
+print(p12)
+
+##Adonis/PERMANOVA
+dist_matrix <- vegdist(t(uninoculated_resilient$abund), method = "bray")
+table(metadata$lineage)
+uninoculated_resilient_adonis <- adonis2(dist_matrix ~ lineage, data = uninoculated_resilient$metadata, permutations = 999)
+print(uninoculated_resilient_adonis)
+
+#         Df SumOfSqs      R2      F Pr(>F)    
+#Model     2  0.97747 0.32987 2.9535  0.001 ***
+#  Residual 12  1.98571 0.67013                  
+#Total    14  2.96318 1.00000                  
+#---
+#  Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+
+##Anosim
+uninoculated_resilient_anosim <- anosim(dist_matrix, grouping = as.factor(uninoculated_resilient$metadata$Sample), permutations = 999)
+print(uninoculated_resilient_anosim) 
+
+#ANOSIM statistic R: 0.4631 
+#Significance: 0.001 
+
+#____________subset group, lib_response:uninoculated_susceptible_________
+uninoculated_susceptible <- amp_subset_samples(amp,lib_response %in% c("uninoculated_susceptible"))
+
+Pcoa_plot <-amp_ordinate(uninoculated_susceptible, # Data
+                         type="PCoA", # Plot type
+                         distmeasure = "bray",
+                         transform = "None",# Distance measure u
+                         sample_color_by="lineage", # Sample colouring
+                         sample_colorframe=TRUE, # Line frame around the group
+                         sample_shape_by="lineage", # Shaping of the samples
+                         x_axis=1, # X-axis dimension
+                         y_axis=2) # Y-axis dimension
+
+
+p13 <- Pcoa_plot + 
+  scale_color_manual(values = c("#FCC84E", "#FCC84E", "#FCC84E")) + # Specify your colors here
+  scale_fill_manual(values = c("#FCC84E", "#FCC84E", "#FCC84E")) + # Fill colors
+  theme(
+    axis.text.y.left = element_text(size = 15),                                    # adjust y-axis text
+    axis.text.x = element_text(size = 15, hjust = 0.5, vjust = 1, angle = 0),      # adjust x-axis label position
+    axis.title.y = element_text(size = 15),
+    axis.title.x = element_text(size = 15),                                        # adjust y-axis title
+    legend.position = "none",
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background = element_rect(fill = "white", color = NA),
+    plot.title = element_text(size = 15, hjust = 0.5)               # title size + style
+  ) +
+  ggtitle("uninoculated susceptible")
+
+print(p13)
+
+##Adonis/PERMANOVA
+dist_matrix <- vegdist(t(uninoculated_susceptible$abund), method = "bray")
+table(metadata$lineage)
+uninoculated_susceptible_adonis <- adonis2(dist_matrix ~ lineage, data = uninoculated_susceptible$metadata, permutations = 999)
+print(uninoculated_susceptible_adonis)
+
+#Df SumOfSqs      R2      F Pr(>F)  
+#Model     2   0.8482 0.25264 2.0282  0.014 *
+#  Residual 12   2.5092 0.74736                
+#Total    14   3.3575 1.00000                
+#---
+#  Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+
+##Anosim
+uninoculated_susceptible_anosim <- anosim(dist_matrix, grouping = as.factor(uninoculated_susceptible$metadata$Sample), permutations = 999)
+print(uninoculated_susceptible_anosim) 
+
+#ANOSIM statistic R: 0.4631 
+#Significance: 0.002 
+
+grid.arrange(p8, p11, p9, p12, p10, p13, ncol = 2)
+
+library(gridExtra)
+library(grid)
+
+grid.arrange(
+  arrangeGrob(
+    p8, p11, p9, p12, p10, p13,
+    ncol = 2,
+    padding = unit(5, "cm")   # adds space between plots
+  )
+)
+
+ggsave(
+  "combined_plot.png",
+  arrangeGrob(p8, p11, p9, p12, p10, p13, ncol = 2),
+  width = 17,   # cm
+  height = 23,  # cm
+  units = "cm",
+  dpi = 400
+)
+
+
+library(magick)
+
+# Read the PDF slide (assuming single-page PDF)
+slide <- image_read_pdf("PCoAs.pdf", density = 400)  # 400 dpi
+
+# Optionally convert to PNG
+image_write(slide, path = "slide_400dpi.png", format = "png")
+
+
+#_________________________________Differential Abundance analysis_____________________
+
+____Plotting DAA___
+
+# Load libraries
+library(ggplot2)
+library(dplyr)
+library(readr)
+
+# 1. Read CSV and clean numeric columns
+df <- read_csv2("DAA genus_uninoculated_resilient_vs_susceptible.csv")#<------------
+cols_to_numeric <- c("log fold change (resilient - susceptible)", "se", "ci.lo.adj", "ci.up.adj", "p.val", "q.val")#<------------
+df[cols_to_numeric] <- lapply(df[cols_to_numeric], function(x) as.numeric(gsub(",", ".", x)))
+
+# 2. Filter zero p-values
+df <- df %>% filter(p.val != 0)
+
+# 3. Create significant column
+df <- df %>% mutate(significant = q.val < 0.1)
+
+# 5. Load mean genus abundance
+genus_abundance <- read.csv("mean_genus_abundance.csv", stringsAsFactors = FALSE)
+
+# 6. Rename column to match 'genus'
+colnames(genus_abundance)[1] <- "genus"
+
+# 7. Join mean abundance into df
+df <- left_join(df, genus_abundance, by = "genus")
+
+
+# 4. Order and factor genus AFTER filtering
+df_filtered <- df %>% 
+  filter(mean_rel_abund > 1) %>%
+  arrange(`log fold change (resilient - susceptible)`)#<---------------
+
+df_filtered$genus <- factor(df_filtered$genus, levels = (df_filtered$genus))
+
+
+
+library(ggplot2)
+library(dplyr)
+
+# Plot forest plot with filtered data
+p <- ggplot(df_filtered, aes(x = genus, 
+                             y = `log fold change (resilient - susceptible)`,# <------------
+                             color = significant)) +
+  geom_point(aes(size = mean_rel_abund)) +
+  geom_errorbar(aes(ymin = ci.lo.adj, ymax = ci.up.adj), width = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_text(data = df_filtered %>% filter(significant),
+            aes(label = signif(q.val, 2)),
+            nudge_x = 0.45,
+            size = 5,
+            color = "red") +
+  coord_flip() +
+  scale_color_manual(values = c("black", "red")) +
+  scale_size_continuous(range = c(2, 8), name = "Mean relative abundance") +
+  labs(
+    x = NULL,
+    y = "Log fold change (Uninoculated: Resilient - Susceptible)",# <-------
+    color = "Significant"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(face = "italic", size = 14),
+    axis.text.x = element_text(size = 14),
+    axis.title.x = element_text(size = 14, margin = margin(t = 15)),
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 12),
+    legend.position = "bottom",
+    theme(plot.background = element_rect(fill = "white", color = NA))
+  )
+
+p
+
+# Overwrite `p` to include white background in the plot object
+p <- p + theme(
+  plot.background = element_rect(fill = "white", color = NA),
+  panel.background = element_rect(fill = "grey97", color = NA)
+)
+
+# Now save it
+ggsave(
+  filename = "DAA_forest_plot_UNIN_RES_SUSC.png",# <-----------
+  plot = p,
+  width = 10,
+  height = 8,
+  dpi = 300,
+  bg = "white"
+)
+
+#______________________LIB vs UNIN______________________
+
+library(dplyr)
+library(readr)
+library(ggplot2)
+
+library(readr)
+library(dplyr)
+
+library_genera <- c("Stenotrophomonas", "Streptomyces", "Variovorax", "Agrobacterium", "Ensifer",
+                    "Bacillus", "Pseudomonas", "Brevundimonas", "Microbacterium", "Plantibacter",
+                    "Rhodococcus", "Rahnella", "Niallia", "Rhizobium", "Achromobacter")
+
+read_and_process_daa <- function(filepath, response_label) {
+  df <- read_delim(filepath, delim = ";", locale = locale(decimal_mark = "."))
+  
+  cols_to_numeric <- c("log fold change (library - uninoculated)", "se", "ci.lo.adj", "ci.up.adj", "p.val", "q.val")
+  df[cols_to_numeric] <- lapply(df[cols_to_numeric], as.numeric)
+  
+  df <- df %>%
+    filter(p.val != 0) %>%
+    mutate(significant = q.val < 0.1,
+           response = response_label) %>%
+    filter(genus %in% library_genera)
+  
+  return(df)
+}
+
+
+df_nostress <- read_and_process_daa("DAA LIBUNIN genus_nostress_library_vs_uninoculated.csv", "nostress")
+df_resilient <- read_and_process_daa("DAA LIBUNIN genus_resilient_library_vs_uninoculated.csv", "resilient")
+df_susceptible <- read_and_process_daa("DAA LIBUNIN genus_susceptible_library_vs_uninoculated.csv", "susceptible")
+
+
+df_raw <- read_csv2("DAA LIBUNIN genus_susceptible_library_vs_uninoculated.csv")
+
+
+
+summary(df_susceptible$ci.lo.adj)
+head(df_susceptible$ci.lo.adj)
+str(df_susceptible)
+
+
+# Combine all
+df_all <- bind_rows(df_nostress, df_resilient, df_susceptible)
+
+# Read abundance table (if not already loaded)
+genus_abundance <- read.csv("mean_genus_abundance.csv", stringsAsFactors = FALSE)
+colnames(genus_abundance)[1] <- "genus"
+
+# Join into the combined DAA data
+df_all <- left_join(df_all, genus_abundance, by = "genus")
+
+library(forcats)  # helpful for factor reordering
+
+df_all <- df_all %>%
+  group_by(response) %>%
+  mutate(genus = fct_reorder(genus, `log fold change (library - uninoculated)`)) %>%
+  ungroup()
+
+# Step 2: Plot with separated aesthetics for points and error bars
+ggplot(df_all, aes(x = genus, y = `log fold change (library - uninoculated)`)) +
+  geom_errorbar(aes(ymin = ci.lo.adj, ymax = ci.up.adj), width = 0.2, size = 0.7, color = "grey40") +  # fixed size
+  geom_point(aes(size = mean_rel_abund, color = significant)) +  # point size/color mapped
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_text(data = df_all %>% filter(significant),
+            aes(label = signif(q.val, 2)),
+            nudge_x = 0.3,
+            size = 4,
+            color = "red") +
+  coord_flip() +
+  scale_color_manual(values = c("black", "red")) +
+  facet_wrap(~ response, scales = "free_y") +
+  labs(
+    title = "Log Fold Change of Library Members vs Uninoculated (by response type)",
+    x = NULL,
+    y = "Log Fold Change (Library - Uninoculated)",
+    size = "Mean Relative Abundance",
+    color = "Significant"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(face = "italic", size = 12),
+    axis.text.x = element_text(size = 12),
+    strip.text = element_text(size = 14),
+    axis.title.x = element_text(size = 14, margin = margin(t = 10)),
+    legend.position = "bottom"
+  )
+
+
+
+library(dplyr)
+library(ggplot2)
+
+# Combine the dataframes
+df_all <- bind_rows(df_nostress, df_resilient, df_susceptible)
+
+# Join the mean abundance info
+df_all <- df_all %>%
+  left_join(genus_abundance, by = "genus")
+
+# Calculate mean log fold change per genus
+genus_order <- df_all %>%
+  group_by(genus) %>%
+  summarise(mean_effect = mean(`log fold change (library - uninoculated)`, na.rm = TRUE)) %>%
+  arrange(desc(mean_effect)) %>%
+  pull(genus)
+
+# Set genus factor levels by this order (descending means highest effect size first)
+df_all$genus <- factor(df_all$genus, levels = genus_order)
+
+
+# Get full genus list from all data combined
+all_genera <- df_all %>% 
+  pull(genus) %>% 
+  unique() %>% 
+  sort()
+
+# Set genus factor levels to this full list in df_all
+df_all <- df_all %>%
+  mutate(genus = factor(genus, levels = all_genera))
+
+# Optional: to order genera by mean effect size across responses:
+library(dplyr)
+
+genus_order <- df_all %>%
+  group_by(genus) %>%
+  summarise(mean_effect = mean(`log fold change (library - uninoculated)`, na.rm = TRUE)) %>%
+  arrange(desc(mean_effect)) %>%
+  pull(genus)
+
+df_all <- df_all %>%
+  mutate(genus = factor(genus, levels = genus_order))
+
+df_all$genus <- factor(df_all$genus, levels = rev(genus_order))
+
+
+# Plot with facet_wrap and free_x scales:
+ggplot(df_all, aes(x = `log fold change (library - uninoculated)`, y = genus, color = significant)) +
+  geom_point(aes(size = mean_rel_abund)) +
+  geom_errorbarh(aes(xmin = ci.lo.adj, xmax = ci.up.adj), height = 0.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  scale_color_manual(values = c("black", "red")) +
+  labs(y = "Genus", x = "Log fold change", color = "Significant", size = "Mean rel. abundance") +
+  facet_wrap(~response, scales = "free_x") +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(face = "italic", size = 12),
+    axis.text.x = element_text(size = 10),
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 14),
+    legend.title = element_text(size = 13),
+    legend.text = element_text(size = 11),
+    strip.text = element_text(size = 13, face = "bold"),
+    panel.background = element_rect(fill = "grey95", color = NA),
+    strip.background = element_rect(fill = "grey80", color = NA),
+    panel.spacing = unit(1, "lines")
+  )
+
+ggplot(df_all, aes(x = `log fold change (library - uninoculated)`, y = genus, color = significant)) +
+  geom_point(aes(size = mean_rel_abund)) +
+  geom_errorbarh(aes(xmin = ci.lo.adj, xmax = ci.up.adj), height = 0.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  scale_color_manual(values = c("black", "red")) +
+  scale_x_continuous(limits = c(-2.5, 7.5)) +  # Uniform x-axis range
+  facet_grid(rows = vars(genus), cols = vars(response), scales = "free_y", space = "free_y") + 
+  labs(y = "Genus", x = "Log fold change", color = "Significant", size = "Mean rel. abundance") +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(face = "italic", size = 12),
+    axis.text.y.right = element_blank(),         # Remove mirrored y-axis
+    axis.ticks.y.right = element_blank(),        # Remove right-side ticks
+    axis.text.x = element_text(size = 10),
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 14),
+    legend.title = element_text(size = 13),
+    legend.text = element_text(size = 11),
+    strip.text = element_text(size = 13, face = "bold"),
+    panel.background = element_rect(fill = "grey95", color = NA),
+    strip.background = element_rect(fill = "grey80", color = NA),
+    panel.spacing.x = unit(1.5, "lines")
+  )
+
+library(ggplot2)
+library(dplyr)
+
+# Make sure df_all has no NAs in ci columns:
+df_all <- df_all %>%
+  filter(!is.na(ci.lo.adj) & !is.na(ci.up.adj))
+
+# Convert genus to factor with desired order (assuming already done)
+# df_all$genus <- factor(df_all$genus, levels = desired_order)
+
+ggplot(df_all, aes(x = `log fold change (library - uninoculated)`, y = genus, color = significant)) +
+  geom_point(aes(size = mean_rel_abund)) +
+  geom_errorbarh(aes(xmin = ci.lo.adj, xmax = ci.up.adj), height = 0.2, na.rm = TRUE) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  scale_color_manual(values = c("black", "red")) +
+  facet_wrap(~response, nrow = 1, strip.position = "bottom") +
+  scale_x_continuous(limits = c(-3, 7.5), expand = expansion(mult = c(0, 0.05))) +
+  labs(
+    y = "Genus",
+    x = "Log fold change (library- - uninoculated)",
+    color = "Significant",
+    size = "Mean Relative Abundance"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    strip.background = element_rect(fill = "grey80", color = NA),
+    panel.spacing.x = unit(1, "lines"),
+    axis.text.y = element_text(face = "italic", size = 12),
+    axis.title = element_text(size = 14),
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 14),
+    strip.text = element_text(size = 14),
+    axis.text.y.right = element_blank(),
+    axis.ticks.y.right = element_blank(),
+    panel.background = element_rect(fill = "grey98")  # light grey background behind panels
+  )
+
+
+p1 <- ggplot(df_all, aes(x = `log fold change (library - uninoculated)`, y = genus, color = significant)) +
+  geom_point(aes(size = mean_rel_abund)) +
+  geom_errorbarh(aes(xmin = ci.lo.adj, xmax = ci.up.adj), height = 0.2, na.rm = TRUE) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  
+  # Add q values above dots for positive log fold change & significant points
+  geom_text(
+    data = df_all %>% filter(significant, `log fold change (library - uninoculated)` > 0),
+    aes(
+      x = `log fold change (library - uninoculated)`,
+      y = genus,
+      label = formatC(q.val, format = "e", digits = 2)
+    ),
+    nudge_y = 0.3,
+    size = 5,
+    color = "red",
+    inherit.aes = FALSE
+  ) +
+  
+  facet_wrap(~response, nrow = 1, strip.position = "top") +
+  scale_x_continuous(limits = c(-3, 7.5), expand = expansion(mult = c(0, 0.05))) +
+  scale_color_manual(values = c("black", "red")) +
+  labs(
+    y = NULL,
+    x = "Log fold change (library - uninoculated)",
+    color = "Significant",
+    size = "Mean Relative Abundance"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    strip.background = element_rect(fill = "grey90", color = NA, size = 0),
+    panel.border = element_blank(),
+    panel.spacing.x = unit(1, "lines"),
+    axis.text.y = element_text(face = "italic", size = 14),
+    axis.title = element_text(size = 14, margin = margin(t = 15)),
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 14),
+    strip.text = element_text(size = 14),
+    axis.text.y.right = element_blank(),
+    axis.ticks.y.right = element_blank(),
+    panel.background = element_rect(fill = "grey97", color = NA),
+    legend.position = "bottom"
+  )
+
+ p1
+
+ggsave("DAA_forest_plot_LIB_UNIN.png", plot = p1, width = 10, height = 7, dpi = 300, bg = "white")
